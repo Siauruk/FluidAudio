@@ -492,7 +492,7 @@ final class TokenDeduplicationRegressionTests: XCTestCase {
         XCTAssertEqual(interior.emitTokensAfterFrame, 104 - 62 - AsrManager.redecodeEmissionJitterFrames)
     }
 
-    func testRedecodePlan_InactiveWithoutPreviousTokensOrTimestamps() {
+    func testRedecodePlan_EmptyWindowsAndLegacyCallers() {
         let legacy = AsrManager.redecodePlan(
             redecode: false,
             previousTokens: [1, 2],
@@ -516,7 +516,14 @@ final class TokenDeduplicationRegressionTests: XCTestCase {
             previousTokenTimestamps: [],
             globalFrameOffset: 0
         )
-        XCTAssertNil(firstWindow.initialTimeIndexOverride, "Single-window streams have nothing to re-decode")
+        XCTAssertEqual(
+            firstWindow.initialTimeIndexOverride, 0, "An empty prior window cannot supply decoder navigation")
+        XCTAssertNil(firstWindow.emitTokensAfterFrame)
+        let afterSilence = AsrManager.redecodePlan(
+            redecode: false, previousTokens: [], previousTokenTimestamps: [], globalFrameOffset: 175
+        )
+        XCTAssertEqual(afterSilence.initialTimeIndexOverride, 0, "Silence must not carry a two-second overlap skip")
+        XCTAssertNil(afterSilence.emitTokensAfterFrame)
     }
 
     /// Clip 03 at chunk 9 (#897): the re-decode after the seam reads `and the
@@ -579,9 +586,50 @@ final class TokenDeduplicationRegressionTests: XCTestCase {
         // The loaded vocabulary normalizes the boundary to a leading space.
         XCTAssertEqual(AsrManager.trailingWordStartIndex(pieces: [" c", "ode", " and", " an"]), 3)
         XCTAssertEqual(AsrManager.trailingWordStartIndex(pieces: ["▁c", "ode", "▁anal", "y", "z"]), 2)
-        XCTAssertNil(AsrManager.trailingWordStartIndex(pieces: ["▁one", "word"]), "index 0 would drop everything")
+        XCTAssertEqual(AsrManager.trailingWordStartIndex(pieces: ["▁one", "word"]), 0)
         XCTAssertNil(AsrManager.trailingWordStartIndex(pieces: ["no", "starts"]))
         XCTAssertNil(AsrManager.trailingWordStartIndex(pieces: []))
+    }
+
+    func testReconcileFinalWindowSeam_SingleWordReplyKeepsNoContinuationFragments() {
+        let seam = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [1, 2, 3, 4], previousTimestamps: [3, 5, 8, 12], trailingWordStart: 0,
+            currentTokens: [3, 4], currentTimestamps: [9, 23],
+            currentPieces: ["p", "."], previousPieces: [" St", "o", "p", "."]
+        )
+        XCTAssertEqual(seam.droppedPrevious, 0)
+        XCTAssertEqual(seam.droppedCurrent, 1, "A redecoded continuation is not a new word")
+    }
+
+    func testReconcileFinalWindowSeam_SingleWordCorrectionCanReplaceTheWholePrefix() {
+        let seam = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [1], previousTimestamps: [3], trailingWordStart: 0,
+            currentTokens: [2, 3, 4], currentTimestamps: [3, 10, 14],
+            currentPieces: [" St", "op", "."], previousPieces: [" St"]
+        )
+        XCTAssertEqual(seam.droppedPrevious, 1)
+        XCTAssertEqual(seam.droppedCurrent, 0)
+    }
+
+    func testReconcileFinalWindowSeam_SingleWordReplyDoesNotEraseAGenuineRepeat() {
+        let seam = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [1], previousTimestamps: [3], trailingWordStart: 0,
+            currentTokens: [1, 2], currentTimestamps: [23, 30],
+            currentPieces: [" stop", "."], previousPieces: [" stop"]
+        )
+        XCTAssertEqual(seam.droppedPrevious, 0)
+        XCTAssertEqual(seam.droppedCurrent, 0)
+    }
+
+    func testReconcileFinalWindowSeam_ShortWindowCompletesSameFrameContraction() {
+        let seam = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [962, 7893, 770, 380], previousTimestamps: [171, 172, 174, 176],
+            trailingWordStart: 3,
+            currentTokens: [380, 7931, 7875, 5258, 366], currentTimestamps: [176, 177, 178, 179, 181],
+            currentPieces: [" I", "'", "m", " going", " to"], previousPieces: [" Ma", "y", "be", " I"]
+        )
+        XCTAssertEqual(seam.droppedPrevious, 1, "The same-frame I is completed as I'm, not a second I")
+        XCTAssertEqual(seam.droppedCurrent, 0)
     }
 
     /// Clip 03 of the #855 fixtures: previous `▁c ode ▁and ▁an`, re-decode
@@ -984,6 +1032,24 @@ final class TokenDeduplicationRegressionTests: XCTestCase {
             previousPieces: [" let's", " go"]
         )
         XCTAssertEqual(consumed.droppedCurrent, 1, "no suppressed copy: the visible `go` is the drifted re-emission")
+    }
+
+    func testReconcileFinalWindowSeam_SuppressedCopyPreservesFastSingleWordRepetitions() {
+        for frame in 103...107 {
+            let kept = AsrManager.reconcileFinalWindowSeam(
+                previousTokens: [2],
+                previousTimestamps: [100],
+                trailingWordStart: 0,
+                currentTokens: [2, 31],
+                currentTimestamps: [frame, 115],
+                currentPieces: [" go", " again"],
+                previousPieces: [" go"],
+                suppressedPieces: [" go"],
+                suppressedTimestamps: [94]
+            )
+            XCTAssertEqual(kept.droppedPrevious, 0)
+            XCTAssertEqual(kept.droppedCurrent, 0, "visible repetition at frame \(frame) must survive token cleanup")
+        }
     }
 
     /// Token ids are not punctuation evidence: id 7948 is `ó` in the v3

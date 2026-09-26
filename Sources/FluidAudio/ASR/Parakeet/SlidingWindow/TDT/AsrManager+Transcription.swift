@@ -66,8 +66,9 @@ extension AsrManager {
     /// tokens for audio the previous windows already emitted are suppressed at
     /// the source, leaving dedup only the jitter margin. `transcribeChunk` pairs
     /// the frame-0 entry with a *fresh* decoder state — see the note there.
-    /// `redecode == false` (the first window) and callers without accumulated
-    /// timestamps get `(nil, nil)` — the legacy navigation.
+    /// A window with no previous tokens starts fresh without an emission cutoff:
+    /// silence cannot supply decoder navigation for the next speech onset.
+    /// Callers without accumulated timestamps retain the legacy navigation.
     nonisolated internal static func redecodePlan(
         redecode: Bool,
         previousTokens: [Int],
@@ -75,9 +76,9 @@ extension AsrManager {
         globalFrameOffset: Int,
         lastWordStartFrame: Int? = nil
     ) -> (initialTimeIndexOverride: Int?, emitTokensAfterFrame: Int?) {
-        guard redecode, let previousTimestamps = previousTokenTimestamps, !previousTokens.isEmpty else {
-            return (nil, nil)
-        }
+        guard let previousTimestamps = previousTokenTimestamps else { return (nil, nil) }
+        guard !previousTokens.isEmpty else { return (0, nil) }
+        guard redecode else { return (nil, nil) }
         // Anchor the cutoff at the previous window's last *word*, not its last
         // token: that word may have been cut by the window edge (#897), and the
         // re-decode must be free to re-emit it in full.
@@ -88,16 +89,13 @@ extension AsrManager {
 
     /// Index of the first token of the previous window's last word — a piece
     /// carrying the SentencePiece word boundary, or the leading space the loaded
-    /// vocabulary normalizes it to — or nil when the sequence has no word start
-    /// after its first token (dropping index 0 would discard the whole window).
+    /// vocabulary normalizes it to — or nil when the sequence has no word start.
+    /// Index 0 is valid: a single-word reply still needs seam reconciliation.
     /// Pure, for testability.
     nonisolated internal static func trailingWordStartIndex(pieces: [String]) -> Int? {
-        guard
-            let idx = pieces.lastIndex(where: {
-                $0.hasPrefix(ASRConstants.sentencePieceWordBoundary) || $0.hasPrefix(" ")
-            }), idx > 0
-        else { return nil }
-        return idx
+        pieces.lastIndex {
+            $0.hasPrefix(ASRConstants.sentencePieceWordBoundary) || $0.hasPrefix(" ")
+        }
     }
 
     /// The words of `pieces[0..<upTo]` as (core text, start frame), for matching
@@ -242,8 +240,8 @@ extension AsrManager {
     ///    construction, so only the prefix rule can retire. A different word
     ///    starting later: the re-decode skipped the previous word, keep it.
     /// 3. Retiring additionally requires the re-decode to reach past the
-    ///    previous window's last frame; an empty or early-ending final window
-    ///    keeps the previous word.
+    ///    previous window's last frame, unless it completes that word at the
+    ///    exact same onset. An empty or early-ending final window keeps it.
     /// 4. The re-decode's head is then stripped of seam artifacts: punctuation
     ///    at or before the previous last word's frame, and tokens — punctuation
     ///    included — that duplicate a kept previous token within
@@ -269,7 +267,7 @@ extension AsrManager {
         // The decision is by piece text, so both piece arrays must be aligned
         // with their token arrays; without them the only safe answer is a no-op
         // (an unknown piece would otherwise read as a continuation and drop).
-        guard trailingWordStart > 0, trailingWordStart < previousTokens.count,
+        guard trailingWordStart >= 0, trailingWordStart < previousTokens.count,
             previousTimestamps.count == previousTokens.count,
             currentTimestamps.count == currentTokens.count,
             currentPieces.count == currentTokens.count,
@@ -340,8 +338,17 @@ extension AsrManager {
         let firstWordFrame = firstWordIndex.map { currentTimestamps[$0] }
 
         let overlapsPrevious = firstWordFrame.map { $0 <= previousLastFrame + jitterFrames } ?? false
+        // Short windows can finish a fragment (I -> I'm) before the jitter
+        // margin elapses. An identical onset plus a longer word span is direct
+        // completion evidence; a later repetition does not satisfy this.
+        let completesSameFrameWord =
+            firstWordFrame == lastWordStartFrame
+            && currentWord != previousWord && currentWord.hasPrefix(previousWord)
+            && firstWordIndex.map {
+                currentTimestamps[wordExtent(in: currentPieces, from: $0) - 1] > previousLastFrame
+            } == true
         let retire: Bool
-        if !extendsBeyondPrevious || currentWord.isEmpty || previousWord.isEmpty {
+        if (!extendsBeyondPrevious && !completesSameFrameWord) || currentWord.isEmpty || previousWord.isEmpty {
             retire = false
         } else if currentWord == previousWord {
             retire = false
@@ -416,6 +423,9 @@ extension AsrManager {
                 droppedCurrent = index
                 continue
             }
+            // Suppressed-copy evidence already identifies this as a new word,
+            // even when a fast repetition falls inside token jitter tolerance.
+            if previousWordSuppressed, currentWord == previousWord, index == firstWordIndex { break }
             guard frame <= keptLastFrame + jitterFrames else { break }
             let end =
                 startsWordPiece(in: currentPieces, at: index) ? wordExtent(in: currentPieces, from: index) : index + 1
@@ -510,7 +520,7 @@ extension AsrManager {
                 currentPieces: currentTokens.map { vocabulary[$0] ?? "" },
                 previousPieces: previousTokens.map { vocabulary[$0] ?? "" },
                 suppressedPieces: hypothesis.suppressedTokens.map { vocabulary[$0] ?? "" },
-                suppressedTimestamps: hypothesis.suppressedTimestamps
+                suppressedTimestamps: hypothesis.suppressedTimestamps.map { $0 + globalFrameOffset }
             )
             droppedPrevious = seam.droppedPrevious
             if seam.droppedCurrent > 0 {

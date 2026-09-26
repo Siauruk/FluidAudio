@@ -464,7 +464,7 @@ public actor SlidingWindowAsrManager {
 
             // The window re-decoded the previous window's last word in full (#897):
             // retire that word from the accumulated tokens and from the text state.
-            if droppedPreviousTokens > 0, droppedPreviousTokens < accumulatedTokens.count {
+            if droppedPreviousTokens > 0, droppedPreviousTokens <= accumulatedTokens.count {
                 let dropped = Array(accumulatedTokens.suffix(droppedPreviousTokens))
                 accumulatedTokens.removeLast(droppedPreviousTokens)
                 accumulatedTokenTimestamps.removeLast(min(droppedPreviousTokens, accumulatedTokenTimestamps.count))

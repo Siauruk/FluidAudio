@@ -247,8 +247,8 @@ extension AsrManager {
     ///    included — that duplicate a kept previous token within
     ///    `frameTolerance` inside the jitter region.
     ///
-    /// Returns how many trailing previous tokens to drop (the whole last word
-    /// or none) and how many leading current tokens to drop. Pure, for
+    /// Returns how many trailing previous tokens to drop (from the corrected
+    /// word onward, or none) and how many leading current tokens to drop. Pure, for
     /// testability; timestamps are global frames. Both piece arrays must be
     /// aligned with their token arrays, otherwise the result is a no-op.
     nonisolated internal static func reconcileFinalWindowSeam(
@@ -285,7 +285,7 @@ extension AsrManager {
             return p.hasPrefix(ASRConstants.sentencePieceWordBoundary) || p.hasPrefix(" ")
         }
 
-        let lastWordStartFrame = previousTimestamps[trailingWordStart]
+        var lastWordStartFrame = previousTimestamps[trailingWordStart]
         let previousLastFrame = previousTimestamps[previousTokens.count - 1]
         let extendsBeyondPrevious =
             (currentTimestamps.max() ?? Int.min) > previousLastFrame + jitterFrames
@@ -331,11 +331,31 @@ extension AsrManager {
         }
 
         // 3. The first real word of the re-decode.
-        let previousWord = wordCore(previousPieces.dropFirst(trailingWordStart))
         let firstWord = firstWordPieces(Array(currentPieces.dropFirst(consumed)))
         let currentWord = wordCore(firstWord)
         let firstWordIndex = (consumed..<currentTokens.count).first { startsWordPiece(in: currentPieces, at: $0) }
         let firstWordFrame = firstWordIndex.map { currentTimestamps[$0] }
+        // The jitter margin can expose a fragment before the last word:
+        // "beds and" -> "bedside and" at the same onset. Retire from that
+        // fragment, so later token dedup cannot leave the continuation "ide".
+        var replacementStart = trailingWordStart
+        if extendsBeyondPrevious, let firstWordIndex,
+            let fragmentStart = (0..<trailingWordStart).last(where: { index in
+                guard startsWordPiece(in: previousPieces, at: index),
+                    previousTimestamps[index] == firstWordFrame
+                else { return false }
+                let end = wordExtent(in: previousPieces, from: index)
+                let core = wordCore(previousPieces[index..<end])
+                return !core.isEmpty && currentWord != core && currentWord.hasPrefix(core)
+                    && currentTimestamps[wordExtent(in: currentPieces, from: firstWordIndex) - 1]
+                        > previousTimestamps[end - 1]
+            })
+        {
+            replacementStart = fragmentStart
+            lastWordStartFrame = previousTimestamps[fragmentStart]
+        }
+        let previousWord = wordCore(
+            previousPieces[replacementStart..<wordExtent(in: previousPieces, from: replacementStart)])
 
         let overlapsPrevious = firstWordFrame.map { $0 <= previousLastFrame + jitterFrames } ?? false
         // Short windows can finish a fragment (I -> I'm) before the jitter
@@ -370,9 +390,9 @@ extension AsrManager {
             retire = false
         }
 
-        let droppedPrevious = retire ? previousTokens.count - trailingWordStart : 0
+        let droppedPrevious = retire ? previousTokens.count - replacementStart : 0
         let keptPrevious = Array(
-            zip(previousTokens, previousTimestamps).prefix(retire ? trailingWordStart : previousTokens.count))
+            zip(previousTokens, previousTimestamps).prefix(retire ? replacementStart : previousTokens.count))
         let keptLastFrame = keptPrevious.last?.1 ?? -1
 
         // 4. Strip the seam artifacts from the re-decode's head. When the
@@ -501,9 +521,6 @@ extension AsrManager {
         var currentTokens = hypothesis.ySequence
         var currentTimestamps = hypothesis.timestamps
         var currentConfidences = hypothesis.tokenConfidences
-        var effectivePrevious = previousTokens
-        var effectivePreviousTimestamps = previousTokenTimestamps
-        var droppedPrevious = 0
 
         // Replace the previous window's (possibly edge-cut) last word with the
         // re-decoded one, and strip the seam artifacts the re-decode emits
@@ -522,27 +539,27 @@ extension AsrManager {
                 suppressedPieces: hypothesis.suppressedTokens.map { vocabulary[$0] ?? "" },
                 suppressedTimestamps: hypothesis.suppressedTimestamps.map { $0 + globalFrameOffset }
             )
-            droppedPrevious = seam.droppedPrevious
             if seam.droppedCurrent > 0 {
                 currentTokens.removeFirst(seam.droppedCurrent)
                 currentTimestamps.removeFirst(seam.droppedCurrent)
                 currentConfidences.removeFirst(min(seam.droppedCurrent, currentConfidences.count))
             }
-            effectivePrevious = Array(previousTokens.prefix(trailingWordStart))
-            effectivePreviousTimestamps = Array(previousTimestamps.prefix(trailingWordStart))
-            if droppedPrevious > 0 || seam.droppedCurrent > 0 {
+            if seam.droppedPrevious > 0 || seam.droppedCurrent > 0 {
                 logger.debug(
-                    "Window seam: dropped \(droppedPrevious) trailing previous token(s), \(seam.droppedCurrent) leading current token(s)"
+                    "Window seam: dropped \(seam.droppedPrevious) trailing previous token(s), \(seam.droppedCurrent) leading current token(s)"
                 )
             }
+            // Timed word reconciliation already owns this seam. A second
+            // token-ID pass could remove a word start and leave its suffix.
+            return (currentTokens, currentTimestamps, currentConfidences, encLen, seam.droppedPrevious)
         }
 
         // Apply token deduplication if previous tokens are provided
-        if !effectivePrevious.isEmpty && !currentTokens.isEmpty {
+        if !previousTokens.isEmpty && !currentTokens.isEmpty {
             // Convert this chunk's local frame timestamps into the same global frame
             // space as `previousTokenTimestamps` so dedup can require temporal adjacency.
             let currentGlobalTimestamps: [Int]? =
-                effectivePreviousTimestamps != nil ? currentTimestamps.map { $0 + globalFrameOffset } : nil
+                previousTokenTimestamps != nil ? currentTimestamps.map { $0 + globalFrameOffset } : nil
             // A re-decoded window only leaks duplicates inside the jitter margin
             // (suppression handles the rest), so the matcher must not reach
             // across it: with the legacy 2 s tolerance a word repeated within
@@ -552,8 +569,8 @@ extension AsrManager {
                 redecodePlan.initialTimeIndexOverride == 0
                 ? 2 * Self.redecodeEmissionJitterFrames : ASRConstants.duplicateFrameTolerance
             let (deduped, removedCount) = removeDuplicateTokenSequence(
-                previous: effectivePrevious, current: currentTokens,
-                previousTimestamps: effectivePreviousTimestamps,
+                previous: previousTokens, current: currentTokens,
+                previousTimestamps: previousTokenTimestamps,
                 currentTimestamps: currentGlobalTimestamps,
                 frameTolerance: tolerance,
                 punctuationTokens: punctuationTokenIds)
@@ -563,10 +580,10 @@ extension AsrManager {
                 removedCount > 0
                 ? Array(currentConfidences.dropFirst(removedCount)) : currentConfidences
 
-            return (deduped, adjustedTimestamps, adjustedConfidences, encLen, droppedPrevious)
+            return (deduped, adjustedTimestamps, adjustedConfidences, encLen, 0)
         }
 
-        return (currentTokens, currentTimestamps, currentConfidences, encLen, droppedPrevious)
+        return (currentTokens, currentTimestamps, currentConfidences, encLen, 0)
     }
 
     internal func processTranscriptionResult(

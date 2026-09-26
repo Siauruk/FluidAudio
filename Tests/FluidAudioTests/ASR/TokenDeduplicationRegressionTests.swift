@@ -621,6 +621,55 @@ final class TokenDeduplicationRegressionTests: XCTestCase {
         XCTAssertEqual(seam.droppedCurrent, 0)
     }
 
+    func testReconcileFinalWindowSeam_CompletesEarlierFragmentWithoutSplittingWord() {
+        let previous = [2565, 7870, 575]  // " bed", "s", " and"
+        let current = [2565, 7870, 1267, 575]  // " bed", "s", "ide", " and"
+        let seam = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: previous, previousTimestamps: [16, 17, 20], trailingWordStart: 2,
+            currentTokens: current, currentTimestamps: [16, 17, 18, 30],
+            currentPieces: [" bed", "s", "ide", " and"], previousPieces: [" bed", "s", " and"]
+        )
+        XCTAssertEqual(seam.droppedPrevious, 3)
+        XCTAssertEqual(seam.droppedCurrent, 0)
+        let accumulated = Array(previous.dropLast(seam.droppedPrevious)) + current.dropFirst(seam.droppedCurrent)
+        XCTAssertEqual(accumulated, current, "The corrected whole word must replace the earlier fragment.")
+    }
+
+    func testReconcileFinalWindowSeam_LaterExtendingEarlierWordRemainsWhole() {
+        let seam = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [2565, 7870, 575], previousTimestamps: [16, 17, 20], trailingWordStart: 2,
+            currentTokens: [2565, 7870, 1267, 575], currentTimestamps: [26, 27, 28, 30],
+            currentPieces: [" bed", "s", "ide", " and"], previousPieces: [" bed", "s", " and"]
+        )
+        XCTAssertEqual(seam.droppedPrevious, 0, "A later word does not correct an earlier fragment.")
+        XCTAssertEqual(seam.droppedCurrent, 0, "An extending word must retain its word-start token.")
+    }
+
+    func testRetiredFragmentIsRemovedAcrossConfirmedAndVolatileText() {
+        let trimmed = SlidingWindowAsrManager.removingTrailingWord(
+            "beds and", confirmed: "two beds", volatile: "and")
+        XCTAssertEqual(trimmed?.confirmed, "two")
+        XCTAssertEqual(trimmed?.volatile, "")
+
+        let volatileOnly = SlidingWindowAsrManager.removingTrailingWord(
+            "and", confirmed: "two", volatile: "beds and")
+        XCTAssertEqual(volatileOnly?.confirmed, "two")
+        XCTAssertEqual(volatileOnly?.volatile, "beds")
+        XCTAssertNil(
+            SlidingWindowAsrManager.removingTrailingWord(
+                "unrelated", confirmed: "two beds", volatile: "and"))
+    }
+
+    func testReconcileFinalWindowSeam_EarlyWindowDoesNotRetireEarlierFragment() {
+        let seam = AsrManager.reconcileFinalWindowSeam(
+            previousTokens: [2565, 7870, 575], previousTimestamps: [16, 17, 20], trailingWordStart: 2,
+            currentTokens: [2565, 7870, 1267], currentTimestamps: [16, 17, 18],
+            currentPieces: [" bed", "s", "ide"], previousPieces: [" bed", "s", " and"]
+        )
+        XCTAssertEqual(seam.droppedPrevious, 0, "An early-ending window cannot retire later accepted words.")
+        XCTAssertEqual(seam.droppedCurrent, 0)
+    }
+
     func testReconcileFinalWindowSeam_ShortWindowCompletesSameFrameContraction() {
         let seam = AsrManager.reconcileFinalWindowSeam(
             previousTokens: [962, 7893, 770, 380], previousTimestamps: [171, 172, 174, 176],

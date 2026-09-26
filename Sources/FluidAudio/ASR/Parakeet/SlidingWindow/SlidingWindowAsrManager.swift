@@ -473,12 +473,11 @@ public actor SlidingWindowAsrManager {
                     // for that word rather than its raw token text.
                     let candidates = [droppedText] + (lastWindowRenderedLastWord.map { [$0] } ?? [])
                     for candidate in candidates {
-                        if let trimmed = Self.removingTrailingWord(candidate, from: volatileTranscript) {
-                            volatileTranscript = trimmed
-                            break
-                        }
-                        if let trimmed = Self.removingTrailingWord(candidate, from: confirmedTranscript) {
-                            confirmedTranscript = trimmed
+                        if let trimmed = Self.removingTrailingWord(
+                            candidate, confirmed: confirmedTranscript, volatile: volatileTranscript)
+                        {
+                            confirmedTranscript = trimmed.confirmed
+                            volatileTranscript = trimmed.volatile
                             break
                         }
                     }
@@ -667,6 +666,17 @@ public actor SlidingWindowAsrManager {
         if text == word { return "" }
         guard text.hasSuffix(" " + word) else { return nil }
         return String(text.dropLast(word.count + 1))
+    }
+
+    /// A correction can retire words on both sides of the confirmation boundary.
+    /// Preserve that boundary for all text which the correction does not retire.
+    static func removingTrailingWord(
+        _ word: String, confirmed: String, volatile: String
+    ) -> (confirmed: String, volatile: String)? {
+        let combined = appendingVolatile(confirmed, volatile)
+        guard let trimmed = removingTrailingWord(word, from: combined) else { return nil }
+        if trimmed.count <= confirmed.count { return (trimmed, "") }
+        return (confirmed, String(trimmed.dropFirst(confirmed.isEmpty ? 0 : confirmed.count + 1)))
     }
 
     /// Join the still-volatile text with a newer unconfirmed window's text.
